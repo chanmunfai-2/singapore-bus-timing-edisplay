@@ -1,18 +1,9 @@
-### TODO 
-
-# Add in frame offset and try to modify screen parameters 
-# Change font size 
-# Create time to display bus timings 
-# Modify loop when EPD device is found 
-
 import os
 import sys
-import textwrap
-import threading
 
 from dotenv import load_dotenv
 
-# Load environment variables
+# Load environment variabless
 load_dotenv()
 
 # Setting up directories
@@ -21,16 +12,18 @@ libdir = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__)
 if os.path.exists(libdir):
     sys.path.append(libdir)
 
-import json
 import logging
 import time
-import traceback
+import holidays 
 from datetime import datetime
-# from retreive_telegram_msg import run_bot
-from test import check_telegram
+from retrieve_telegram_message import check_telegram
 
 import requests
 from PIL import Image, ImageDraw, ImageFont
+
+DEFAULT_MESSAGE = "Nothing is possible"
+IGNORE_BUS_TIMING = False # Global state variable; to be controlled by Tele bot 
+FRAME_X_OFFSET = 45 # offset from x-axis due to Ikea frame 
 
 EPD_AVAILABLE = False 
 try: # only for Linux devices like raspberry pi 
@@ -73,65 +66,6 @@ def get_bus_arrival(api_key, bus_stop_code):
         logging.error("Error: Unable to fetch data. Status code: " + str(response.status_code))
         return []
 
-def get_train_disruptions():
-    api_key = os.getenv('API_KEY')
-    url = "https://datamall2.mytransport.sg/ltaodataservice/TrainServiceAlerts"
-    headers = {
-        'AccountKey': api_key,
-        'accept': 'application/json'
-    }
-
-    print("Fetching train disruptions...")
-    print(f"URL: {url}")
-    print(f"Headers: {headers}")
-
-    try:
-        response = requests.get(url, headers=headers)
-        print(f"Response status code: {response.status_code}")
-        print(f"Response content: {response.text}")
-
-        response.raise_for_status()  # Raises an HTTPError for bad responses
-        data = response.json()
-
-        print("Parsed JSON data:")
-        print(json.dumps(data, indent=2))
-
-        disruptions = []
-        content = ''
-
-        if 'value' in data:
-            print("'value' key found in data")
-            if 'AffectedSegments' in data['value'] and data['value']['AffectedSegments']:
-                print("Processing AffectedSegments...")
-                for segment in data['value']['AffectedSegments']:
-                    disruption = {
-                        'Line': segment.get('Line', ''),
-                        'Direction': segment.get('Direction', ''),
-                        'Stations': segment.get('Stations', '').split(',')
-                    }
-                    disruptions.append(disruption)
-                    print(f"Added disruption: {disruption}")
-
-            if 'Message' in data['value'] and data['value']['Message']:
-                print("Processing Message...")
-                content = data['value']['Message'][0].get('Content', '')
-                print(f"Content: {content}")
-
-        if not disruptions and not content:
-            print("No disruptions found")
-            return "No Disruptions Today!"
-        else:
-            result = {
-                'disruptions': disruptions,
-                'content': content
-            }
-            print(f"Returning result: {result}")
-            return result
-
-    except requests.RequestException as e:
-        print(f"Error fetching train disruptions: {e}")
-        return None
-
 def display_bus_arrivals(epd, draw, font, bus_info_A, bus_info_B):
     draw.rectangle((0, 0, epd.width, epd.height), fill=255)  # Clear the display
     y = 20  # Initial Y position for text
@@ -141,8 +75,8 @@ def display_bus_arrivals(epd, draw, font, bus_info_A, bus_info_B):
 
     # Display for Bus Stop A (left column)
     for service_no, arrival_times in bus_info_A:
-        draw.rectangle((20, y+50, 180, y + 110), fill=0)
-        draw.text((50, y + 58), service_no, font=font, fill=255)
+        draw.rectangle((20 + FRAME_X_OFFSET, y+50, 180 + FRAME_X_OFFSET, y + 110), fill=0)
+        draw.text((50 + FRAME_X_OFFSET, y + 58), service_no, font=font, fill=255)
         times_text = " | ".join(map(str, arrival_times))
         draw.text((220, y + 55), times_text, font=font, fill=0)
         y += 70
@@ -158,55 +92,63 @@ def display_bus_arrivals(epd, draw, font, bus_info_A, bus_info_B):
         times_text = " | ".join(map(str, arrival_times))
         draw.text((220 + column_offset, y + 55), times_text, font=font, fill=0)
         y += 70
+
+    # Display time last updated
+    now = datetime.now()
+    formatted_time = now.strftime("%-I:%M %p, %d %b")
+    time_text = "Last Updated: " + formatted_time
+    draw.text((50 + FRAME_X_OFFSET, y), time_text, font=font, fill = 0)    
     
     epd.display(epd.getbuffer(Himage))
 
-def display_train_disruption(epd, draw, font, train_info):
-    # Clear the image
-    Himage = Image.new('1', (epd.width, epd.height), 255)
-    draw = ImageDraw.Draw(Himage)
+def display_center_message(epd, draw, font, message): 
+    # Works for single line so far
+    draw.rectangle((0, 0, epd.width, epd.height), fill=255)  # Clear the display
 
-    # Draw title
-    draw.text((10, 10), "Train Disruptions", font=font, fill=0)
+    # Get text size
+    bbox = draw.textbbox((0,0), message, font=font)
+    text_width = bbox[2] - bbox[0]
+    text_height = bbox[3] - bbox[1]
 
-    if train_info == "No Disruptions Today!":
-        draw.text((10, 60), train_info, font=font, fill=0)
-    elif train_info:
-        y_offset = 60
-        for disruption in train_info['disruptions']:
-            draw.text((10, y_offset), f"Line: {disruption['Line']}", font=font, fill=0)
-            y_offset += 40
-            draw.text((10, y_offset), f"Direction: {disruption['Direction']}", font=font, fill=0)
-            y_offset += 40
-            stations = ", ".join(disruption['Stations'])
-            draw.text((10, y_offset), f"Stations: {stations}", font=font, fill=0)
-            y_offset += 60
+    x = (epd.width - text_width) // 2
+    y = (epd.height - text_height) // 2
 
-        # Display content (message) if available
-        if train_info['content']:
-            draw.text((10, y_offset), "Message:", font=font, fill=0)
-            y_offset += 40
-            # Wrap text to fit display width
-            wrapped_text = textwrap.wrap(train_info['content'], width=40)  # Adjust width as needed
-            for line in wrapped_text:
-                draw.text((10, y_offset), line, font=font, fill=0)
-                y_offset += 30
+    draw.text((x,y), message, font=font, fill = 0)
 
-    # Display the image on the E-Ink display
     epd.display(epd.getbuffer(Himage))
 
+def should_display_bus_timing(): 
+    now = datetime.now()
+    day_of_week = now.weekday() # 0 for Monday, ... 6 for Sunday
+
+    current_hour = now.hour
+    current_minute = now.minute
+    current_time_in_minutes = current_hour * 60 + current_minute
+    is_waking_hours = (7 <= current_hour <= 23) # 7:00 am to 11:59pm 
+
+    sg_holidays = holidays.Singapore()
+    is_public_holiday = now.date() in sg_holidays
+    is_public_holiday_and_waking_hours = is_public_holiday and is_waking_hours
+
+    is_weekend_and_waking_hours = day_of_week >=5 and is_waking_hours
+
+    # Weekday Morning - 7:15am to 9:45am 
+    morning_start = 7 * 60 + 15 # 715am 
+    morning_end = 9 * 60 + 45 # 945am 
+    is_weekday_morning = day_of_week <5 and (morning_start <= current_time_in_minutes <=morning_end)
+
+    # Weekday Evening - 530pm to 715pm 
+    evening_start = 17 * 60 + 30 # 530pm 
+    evening_end = 19 * 60 + 30 # 715pm 
+    is_weekday_evening = day_of_week <5 and (evening_start <= current_time_in_minutes <= evening_end)
+    
+    return is_weekend_and_waking_hours or is_public_holiday_and_waking_hours or is_weekday_evening or is_weekday_morning
+
 if __name__ == "__main__": 
+
     api_key = os.getenv('API_KEY')
     bus_stop_code_A = os.getenv('BUS_STOP_CODE_A')
     bus_stop_code_B = os.getenv('BUS_STOP_CODE_B')
-
-    # Start Telegram bot in background thread
-    # telegram_thread = threading.Thread(target=run_bot, daemon=True)
-    # telegram_thread.start()
-
-    # with open("telegram_msg.txt", "r", encoding="utf-8") as f: 
-    #     content = f.read()
-    #     print(content)
 
     if EPD_AVAILABLE is True:
         try: # EPD display is connected
@@ -218,7 +160,7 @@ if __name__ == "__main__":
             epd.Clear()
 
         # Using a larger and bold font
-            font48 = ImageFont.truetype(os.path.join(picdir, 'OpenSans-Bold.ttf'), 32)
+            font48 = ImageFont.truetype(os.path.join(picdir, 'OpenSans-Bold.ttf'), 0)
             Himage = Image.new('1', (epd.width, epd.height), 255)
             draw = ImageDraw.Draw(Himage)
             
@@ -227,11 +169,28 @@ if __name__ == "__main__":
             bus_stop_code_B = os.getenv('BUS_STOP_CODE_B')
 
             while True:
+                msg = check_telegram() # can always check Telegram 
+                if msg == "/ignore_bus": 
+                    IGNORE_BUS_TIMING = True
+                    print("Telegram Instruction: Ignore Bus Timing")
+                elif msg == "/resume_bus": 
+                    IGNORE_BUS_TIMING = False
+                    print("Telegram Instruction: Resume Bus Timing")       
+
                 #Display Bus Arrival
-                bus_info_A = get_bus_arrival(api_key, bus_stop_code_A)
-                bus_info_B = get_bus_arrival(api_key, bus_stop_code_B)
-                display_bus_arrivals(epd, draw, font48, bus_info_A, bus_info_B)
-                time.sleep(30)  # Refresh every 30 seconds
+                if should_display_bus_timing() and not IGNORE_BUS_TIMING: 
+                    bus_info_A = get_bus_arrival(api_key, bus_stop_code_A)
+                    bus_info_B = get_bus_arrival(api_key, bus_stop_code_B)
+                    display_bus_arrivals(epd, draw, font48, bus_info_A, bus_info_B)
+                    time.sleep(60)  # Refresh every minute
+
+                # Display Telegram Message 
+                else: # outside of bus display timings
+                    msg = check_telegram
+                    if msg is None or msg == "/ignore_bus": 
+                        msg = DEFAULT_MESSAGE
+                    display_center_message(epd, draw, font48, msg)
+                    time.sleep(60)
 
         except IOError as e:
             logging.error(e)
@@ -243,19 +202,45 @@ if __name__ == "__main__":
             exit()
 
     else: # EPD_available is false 
-        #Display Bus Arrival
-        while True:
-            # Check for telegram messages
-            msg = check_telegram()
-            if msg:
-                print("Telegram message:", msg)
+        # Test Telegram and Bus Arrivals separately
+        while True: 
+            # Check for Telegram commands to ignore bus timings 
+            msg = check_telegram() # can always check Telegram 
+            if msg == "/ignore_bus": 
+                IGNORE_BUS_TIMING = True
+                print("Telegram Instruction: Ignore Bus Timing")
+            elif msg == "/resume_bus": 
+                IGNORE_BUS_TIMING = False
+                print("Telegram Instruction: Resume Bus Timing")         
 
-            #Display Bus Arrival
-            bus_info_A = get_bus_arrival(api_key, bus_stop_code_A)
-            bus_info_B = get_bus_arrival(api_key, bus_stop_code_B)
-            print(bus_info_A, bus_info_B)
+            # Display Bus Timings 
+            if  should_display_bus_timing() and not IGNORE_BUS_TIMING: 
+                bus_info_A = get_bus_arrival(api_key, bus_stop_code_A)
+                bus_info_B = get_bus_arrival(api_key, bus_stop_code_B)
+                print(bus_info_A, bus_info_B)
+
+                time.sleep(10)  
             
-            time.sleep(10)  # Refresh every 30 seconds
+            # Display Telegram Messages 
+            else: 
+                if msg and msg != "/ignore_bus":
+                    print("Telegram message:", msg)
+                else: print("Default Telegram message:", DEFAULT_MESSAGE)
+
+                time.sleep(10)
+                
+        ### Test Telegram and Bus Arrivals together 
+        # while True:
+        #     msg = check_telegram()
+        #     if msg:
+        #         print("Telegram message:", msg)
+        #     else: print("Default Telegram message:", DEFAULT_MESSAGE)
+
+        #     bus_info_A = get_bus_arrival(api_key, bus_stop_code_A)
+        #     bus_info_B = get_bus_arrival(api_key, bus_stop_code_B)
+        #     print(bus_info_A, bus_info_B)
+            
+        #     time.sleep(10)  
                 
 
         
